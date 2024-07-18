@@ -239,6 +239,9 @@ extern "C" {
  */
 WEBVIEW_API webview_t webview_create(int debug, void *window);
 
+// JKP
+WEBVIEW_API webview_t webview_create2(int debug, void *window, int no_close_win );
+
 /**
  * Destroys a webview instance and closes the native window.
  *
@@ -253,6 +256,14 @@ WEBVIEW_API webview_error_t webview_destroy(webview_t w);
  */
 WEBVIEW_API webview_error_t webview_run(webview_t w);
 
+
+// JKP
+WEBVIEW_API int webview_step( webview_t w, int blocking );
+
+// JKP
+WEBVIEW_API webview_error_t webview_setvis( webview_t w, int bVis );
+
+	
 /**
  * Stops the main loop. It is safe to call this function from another other
  * background thread.
@@ -1212,6 +1223,12 @@ private:
 };
 
 class engine_base {
+	
+	// JKP
+protected:
+	int should_exit=0;
+	bool m_run_called = false;
+
 public:
   virtual ~engine_base() = default;
 
@@ -1292,6 +1309,17 @@ window.__webview__.onUnbind(" +
   result<void *> widget() { return widget_impl(); }
   result<void *> browser_controller() { return browser_controller_impl(); };
   noresult run() { return run_impl(); }
+  
+  //JKP  
+	int step( int blocking ) { 
+		return step_impl( blocking );
+	}
+	
+	noresult setvis( int bVis ){
+		setvis_impl( bVis );
+		return {};
+	}
+	
   noresult terminate() { return terminate_impl(); }
   noresult dispatch(std::function<void()> f) { return dispatch_impl(f); }
   noresult set_title(const std::string &title) { return set_title_impl(title); }
@@ -1315,6 +1343,11 @@ protected:
   virtual result<void *> widget_impl() = 0;
   virtual result<void *> browser_controller_impl() = 0;
   virtual noresult run_impl() = 0;
+  
+  //JKP
+  virtual int step_impl( int blocking ) = 0;
+  virtual void setvis_impl( int bVis ) = 0;  
+  
   virtual noresult terminate_impl() = 0;
   virtual noresult dispatch_impl(std::function<void()> f) = 0;
   virtual noresult set_title_impl(const std::string &title) = 0;
@@ -1471,9 +1504,15 @@ protected:
   virtual void on_window_created() { inc_window_count(); }
 
   virtual void on_window_destroyed(bool skip_termination = false) {
+	
+	// JKP
+	should_exit = 1;
+	
     if (dec_window_count() <= 0) {
       if (!skip_termination) {
-        terminate();
+			//JKP
+        if( m_run_called ) terminate();
+        //terminate();
       }
     }
   }
@@ -1687,14 +1726,41 @@ private:
 };
 
 class gtk_webkit_engine : public engine_base {
+	
+	gint win_loc_x = 0;
+	gint win_loc_y = 0;
+	
 public:
-  gtk_webkit_engine(bool debug, void *window)
-      : m_owns_window{!window}, m_window(static_cast<GtkWidget *>(window)) {
+
+  gtk_webkit_engine(bool debug, void *window, bool no_close_win = false ) : m_owns_window{!window}, m_window(static_cast<GtkWidget *>(window)) {
+			
     if (m_owns_window) {
       if (!gtk_init_check(nullptr, nullptr)) {
         throw exception{WEBVIEW_ERROR_UNSPECIFIED, "GTK init failed"};
       }
       m_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+      //m_window = gtk_window_new(GTK_WINDOW_POPUP);	// to turn off win controls including frame resizing
+      //gtk_window_set_decorated (GTK_WINDOW(m_window), FALSE);
+      
+      if(no_close_win) {
+			//This call removes titlebar decorations (but the window frame still shows and the title can be set)
+			GtkHeaderBar* header_bar = (GtkHeaderBar*)gtk_header_bar_new();
+			gtk_header_bar_set_has_subtitle( header_bar, FALSE);			
+			gtk_widget_set_name( (GtkWidget*)header_bar, "shb_headerbar" );
+			
+			GtkCssProvider* css = gtk_css_provider_new();
+			GdkScreen* screen = gdk_display_get_default_screen(gdk_display_get_default());
+			gtk_style_context_add_provider_for_screen(screen, GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        
+			gtk_css_provider_load_from_data(css, "#shb_headerbar {background-color: #0e3f2b; color: #cfa949; padding-top: 0px; padding-bottom: 0px; margin-bottom: -8px; margin-top: -8px; }", -1, NULL);
+			GtkStyleContext* context = gtk_widget_get_style_context( (GtkWidget*)header_bar );
+			gtk_style_context_add_class(context, "shb_headerbar");
+        
+			gtk_window_set_titlebar( GTK_WINDOW(m_window), (GtkWidget*)header_bar );
+			
+			g_object_unref(css);
+		}
+      
       on_window_created();
       g_signal_connect(G_OBJECT(m_window), "destroy",
                        G_CALLBACK(+[](GtkWidget *, gpointer arg) {
@@ -1758,7 +1824,7 @@ public:
       if (m_owns_window) {
         // Disconnect handlers to avoid callbacks invoked during destruction.
         g_signal_handlers_disconnect_by_data(GTK_WINDOW(m_window), this);
-        gtk_window_close(GTK_WINDOW(m_window));
+        gtk_window_close(GTK_WINDOW(m_window));        
         on_window_destroyed(true);
       }
       m_window = nullptr;
@@ -1792,13 +1858,49 @@ protected:
   }
 
   noresult run_impl() override {
+    m_run_called = true;	// JKP
     gtk_main();
     return {};
   }
+  
+	// JKP
+	// https://manpagez.com/html/gtk2/gtk2-2.24.29/gtk2-General.php#gtk-main-iteration
+	int step_impl( int blocking ) override {
+		
+		gtk_main_iteration_do( blocking==1 );
+		
+		if(should_exit!=0){
+			gtk_main_iteration_do( 1 );
+		}
+		
+		return should_exit;
+	}
 
-  noresult terminate_impl() override {
-    return dispatch_impl([] { gtk_main_quit(); });
-  }
+	// JKP
+	void setvis_impl( int bVis ) override {
+	  
+		//https://docs.gtk.org/gtk3/method.Widget.get_window.html
+		GdkWindow *gdk_window = gtk_widget_get_window(GTK_WIDGET(m_window));
+		if(gdk_window==NULL) return;
+		
+		if(bVis){			
+			if( gdk_window_is_visible( gdk_window )) return;	//already visible
+			gdk_window_show( gdk_window );
+			gdk_window_move ( gdk_window, win_loc_x, win_loc_y );
+		}else{
+			if( !gdk_window_is_visible( gdk_window )) return;	//already hidden
+			gdk_window_get_position ( gdk_window, &win_loc_x, &win_loc_y );
+			gdk_window_hide( gdk_window );
+		}
+	}
+	
+	noresult terminate_impl() override {
+		return dispatch_impl([] { 
+			//JKP
+			gtk_main_quit(); 
+			//g_application_quit(); //need the app pointer??
+		});
+	}
 
   noresult dispatch_impl(std::function<void()> f) override {
     g_idle_add_full(G_PRIORITY_HIGH_IDLE, (GSourceFunc)([](void *f) -> int {
@@ -2179,7 +2281,19 @@ protected:
     return {};
   }
 
+	// JKP
+  int step_impl( int blocking ) override {
+    // not implemented yet
+    return 0;
+  }
+  
+	// JKP
+	void setvis_impl( int bVis ) override {
+		// not implemented yet
+	}
+
   noresult run_impl() override {
+	 m_run_called = true;	// JKP
     auto app = get_shared_application();
     objc::msg_send<void>(app, "run"_sel);
     return {};
@@ -3920,6 +4034,7 @@ public:
 
 protected:
   noresult run_impl() override {
+    m_run_called = true;	// JKP
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
       TranslateMessage(&msg);
@@ -3945,10 +4060,23 @@ protected:
     }
     return error_info{WEBVIEW_ERROR_INVALID_STATE};
   }
+  
   noresult terminate_impl() override {
     PostQuitMessage(0);
     return {};
   }
+
+	// JKP
+  int step_impl( int blocking ) override {
+    // not implemented yet
+    return 0;
+  }
+  
+	// JKP
+	void setvis_impl( int bVis ) override {
+		// not implemented yet
+	}
+
   noresult dispatch_impl(dispatch_fn_t f) override {
     PostMessageW(m_message_window, WM_APP, 0, (LPARAM) new dispatch_fn_t(f));
     return {};
@@ -4250,12 +4378,18 @@ webview *cast_to_webview(void *w) {
 } // namespace detail
 } // namespace webview
 
-WEBVIEW_API webview_t webview_create(int debug, void *wnd) {
+
+WEBVIEW_API webview_t webview_create(int debug, void *wnd ) {
+	return webview_create2( static_cast<bool>(debug), wnd, false );
+}
+
+//JKP bool no_close_win = false
+WEBVIEW_API webview_t webview_create2(int debug, void *wnd, int no_close_win ) {
   using namespace webview::detail;
   webview::webview *w{};
   auto err = api_filter(
       [=]() -> webview::result<webview::webview *> {
-        return new webview::webview{static_cast<bool>(debug), wnd};
+        return new webview::webview{static_cast<bool>(debug), wnd, static_cast<bool>(no_close_win) };
       },
       [&](webview::webview *w_) { w = w_; });
   if (err == WEBVIEW_ERROR_OK) {
@@ -4275,6 +4409,19 @@ WEBVIEW_API webview_error_t webview_destroy(webview_t w) {
 WEBVIEW_API webview_error_t webview_run(webview_t w) {
   using namespace webview::detail;
   return api_filter([=] { return cast_to_webview(w)->run(); });
+}
+
+// JKP
+WEBVIEW_API int webview_step( webview_t w, int blocking ) {
+	using namespace webview::detail;	
+	return cast_to_webview(w)->step( blocking ); 
+}
+
+// JKP
+WEBVIEW_API webview_error_t webview_setvis( webview_t w, int bVis ){
+	using namespace webview::detail;	
+	cast_to_webview(w)->setvis( bVis );	
+	return {};
 }
 
 WEBVIEW_API webview_error_t webview_terminate(webview_t w) {
